@@ -1,0 +1,53 @@
+
+services:
+
+  mysql:
+    image: mysql:8.4
+    container_name: ventas-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ventas_catalogo
+      MYSQL_USER: ventas_app
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    networks:
+      - ventas_network
+
+  postgresql:
+    image: postgres:17
+    container_name: ventas-postgresql
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ventas_app
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ventas_operaciones
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - ventas_network
+
+  mongodb:
+    image: mongo:8.0
+    container_name: ventas-mongodb
+    restart: unless-stopped
+    ports:
+      - "27018:27017"
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - ventas_network
+
+volumes:
+  mysql_data:
+  postgres_data:
+  mongo_data:
+
+networks:
+  ventas_network:
+    driver: bridge
