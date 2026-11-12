@@ -14,6 +14,7 @@ services:
       - "3307:3306"
     volumes:
       - mysql_data:/var/lib/mysql
+      - ../databases/mysql/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
     networks:
       - ventas_network
 
@@ -29,6 +30,7 @@ services:
       - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ../databases/postgresql/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
     networks:
       - ventas_network
 

@@ -4,9 +4,9 @@ const router = express.Router();
 
 const mysql = require('../database/mysql');
 const postgres = require('../database/postgresql');
-const { MongoClient } = require('mongodb');
+const { getMongoDB } = require('../database/mongodb');
 
-// Verificar conexión a MySQL
+// VERIFICAR MYSQL
 router.get('/mysql', async (req, res) => {
     try {
         await mysql.query('SELECT 1');
@@ -15,6 +15,7 @@ router.get('/mysql', async (req, res) => {
             database: 'MySQL',
             status: 'conectado'
         });
+
     } catch (error) {
         res.status(500).json({
             database: 'MySQL',
@@ -24,7 +25,7 @@ router.get('/mysql', async (req, res) => {
     }
 });
 
-// Verificar conexión a PostgreSQL
+// VERIFICAR POSTGRESQL
 router.get('/postgresql', async (req, res) => {
     try {
         await postgres.query('SELECT 1');
@@ -33,6 +34,7 @@ router.get('/postgresql', async (req, res) => {
             database: 'PostgreSQL',
             status: 'conectado'
         });
+
     } catch (error) {
         res.status(500).json({
             database: 'PostgreSQL',
@@ -42,26 +44,24 @@ router.get('/postgresql', async (req, res) => {
     }
 });
 
-// Verificar conexión a MongoDB
+// VERIFICAR MONGODB
 router.get('/mongodb', async (req, res) => {
-    const client = new MongoClient(process.env.MONGO_URI);
-
     try {
-        await client.connect();
-        await client.db('admin').command({ ping: 1 });
+        const database = getMongoDB();
+
+        await database.command({ ping: 1 });
 
         res.json({
             database: 'MongoDB',
             status: 'conectado'
         });
+
     } catch (error) {
         res.status(500).json({
             database: 'MongoDB',
             status: 'error',
             message: error.message
         });
-    } finally {
-        await client.close();
     }
 });
 
