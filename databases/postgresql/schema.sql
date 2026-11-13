@@ -21,12 +21,14 @@ CREATE TABLE IF NOT EXISTS inventario (
 );
 
 CREATE TABLE IF NOT EXISTS ventas (
-    id_venta SERIAL PRIMARY KEY,
+    id_venta SERIAL,
     id_cliente INT NOT NULL,
     id_sucursal INT NOT NULL,
     fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     total NUMERIC(12,2) NOT NULL,
     estado VARCHAR(30) DEFAULT 'completada',
+
+    PRIMARY KEY (id_venta, id_sucursal),
 
     FOREIGN KEY (id_sucursal)
         REFERENCES sucursales(id_sucursal)
@@ -35,12 +37,13 @@ CREATE TABLE IF NOT EXISTS ventas (
 CREATE TABLE IF NOT EXISTS detalle_venta (
     id_detalle SERIAL PRIMARY KEY,
     id_venta INT NOT NULL,
+    id_sucursal INT NOT NULL,
     id_producto INT NOT NULL,
     cantidad INT NOT NULL,
     precio_unitario NUMERIC(10,2) NOT NULL,
 
-    FOREIGN KEY (id_venta)
-        REFERENCES ventas(id_venta)
+    FOREIGN KEY (id_venta, id_sucursal)
+        REFERENCES ventas(id_venta, id_sucursal)
 );
 
 CREATE TABLE IF NOT EXISTS movimientos_inventario (
