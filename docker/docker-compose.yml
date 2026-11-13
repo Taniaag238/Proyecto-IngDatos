@@ -42,6 +42,7 @@ services:
       - "27018:27017"
     volumes:
       - mongo_data:/data/db
+      - ../databases/mongodb/init.js:/docker-entrypoint-initdb.d/01-init.js:ro
     networks:
       - ventas_network
 
