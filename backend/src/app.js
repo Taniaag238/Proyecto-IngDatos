@@ -1,10 +1,8 @@
-
 const express = require('express');
 const cors = require('cors');
-
 const databaseRoutes = require('./routes/databaseRoutes');
-
 const app = express();
+const ventasRoutes = require('./routes/ventasRoutes');
 
 // Middlewares
 app.use(cors());
@@ -25,5 +23,6 @@ app.get('/api/health', (req, res) => {
 
 // Rutas para comprobar conexiones
 app.use('/api/database', databaseRoutes);
+app.use('/api/ventas', ventasRoutes);
 
 module.exports = app;

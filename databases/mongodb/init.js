@@ -1,4 +1,3 @@
-
 // Sistema de Ventas e Inventarios
 // Inicialización de MongoDB
 

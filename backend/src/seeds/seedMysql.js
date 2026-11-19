@@ -1,6 +1,5 @@
 // Seed de MySQL (ventas_catalogo)
-// Objetivo: 1,000 categorias + 1,000 proveedores + 22,000 clientes
-//           + 22,000 contactos + 8,000 productos = 54,000 filas
+// Objetivo: 1,000 categorias + 1,000 proveedores + 22,000 clientes + 22,000 contactos + 8,000 productos = 54,000 filas
 
 const path = require('path');
 require('dotenv').config({ path: path.resolve(__dirname, '../../.env'), quiet: true });
