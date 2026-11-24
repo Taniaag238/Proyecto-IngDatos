@@ -26,7 +26,10 @@ CREATE TABLE IF NOT EXISTS ventas (
     fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     total NUMERIC(12,2) NOT NULL CHECK (total >= 0),
     estado VARCHAR(30) DEFAULT 'completada',
+    idempotency_key VARCHAR(120),
+    request_hash CHAR(64),
     PRIMARY KEY (id_venta, id_sucursal),
+    UNIQUE (id_sucursal, idempotency_key),
     FOREIGN KEY (id_sucursal)
         REFERENCES sucursales(id_sucursal)
 ) PARTITION BY LIST (id_sucursal);

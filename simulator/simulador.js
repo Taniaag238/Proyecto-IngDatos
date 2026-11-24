@@ -2,7 +2,7 @@ const axios = require('axios');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const { performance } = require('perf_hooks');
-const { MongoClient } = require('mongodb');
+const { randomUUID } = require('crypto');
 
 // CARGAR LAS VARIABLES DE ENTORNO DEL BACKEND
 require('dotenv').config({
@@ -10,6 +10,10 @@ require('dotenv').config({
 });
 
 const API_URL = 'http://localhost:3000/api/ventas';
+const SUMMARY_API_URL = 'http://localhost:3000/api/simulaciones/resumen';
+const SIMULADOR_API_KEY = process.env.SIMULADOR_API_KEY;
+// IDENTIFICADOR UNICO DE CADA EJECUCION DEL SIMULADOR
+const ID_EJECUCION = randomUUID();
 
 // CONFIGURACION DEL SIMULADOR
 const TOTAL_VENTAS = Number(process.argv[2] || 10);
@@ -122,93 +126,112 @@ function obtenerInformacionGit() {
 }
 
 // ENVIAR UNA VENTA A LA API Y MEDIR SU LATENCIA
-async function enviarVenta(venta) {
+
+// ENVIAR UNA VENTA A LA API Y MEDIR SU LATENCIA
+async function enviarVenta(venta, numeroVenta) {
     const tiempoInicio = performance.now();
 
-    try {
-        const respuesta = await axios.post(API_URL, venta);
+    // CREAR UNA CLAVE ESTABLE PARA ESTA VENTA
+    const idempotencyKey = `${ID_EJECUCION}-${numeroVenta}`;
 
-        const latencia = Number(
-            (performance.now() - tiempoInicio).toFixed(2)
-        );
+    const MAX_INTENTOS = 3;
+    let ultimoError;
 
-        console.log(
-            `Venta ${respuesta.data.venta.id_venta} registrada correctamente.`
-        );
+    for (let intento = 1; intento <= MAX_INTENTOS; intento++) {
+        try {
+            const respuesta = await axios.post(
+                API_URL,
+                venta,
+                {
+                    headers: {
+                        'Idempotency-Key': idempotencyKey
+                    },
+                    timeout: 10000
+                }
+            );
 
-        return {
-            exitosa: true,
-            id_venta: respuesta.data.venta.id_venta,
-            status_http: respuesta.status,
-            codigo_error: null,
-            latencia_ms: latencia
-        };
+            const latencia = Number(
+                (performance.now() - tiempoInicio).toFixed(2)
+            );
 
-    } catch (error) {
-        const latencia = Number(
-            (performance.now() - tiempoInicio).toFixed(2)
-        );
+            console.log(
+                `Venta ${respuesta.data.venta.id_venta} registrada correctamente.`
+            );
 
-        const status = error.response
-            ? error.response.status
-            : null;
+            return {
+                exitosa: true,
+                id_venta: respuesta.data.venta.id_venta,
+                status_http: respuesta.status,
+                codigo_error: null,
+                latencia_ms: latencia
+            };
 
-        const codigo = error.response?.data?.codigo ||
-            (status ? `HTTP_${status}` : error.code || 'ERROR_DESCONOCIDO');
+        } catch (error) {
+            ultimoError = error;
 
-        const mensaje = error.response
-            ? error.response.data.mensaje
-            : error.message;
+            const status = error.response?.status;
 
-        console.log(`Venta rechazada (${codigo}): ${mensaje}`);
+            // SOLO REINTENTAR ERRORES DE RED, TIMEOUT O SERVIDOR
+            const puedeReintentar = !status || status >= 500;
 
-        return {
-            exitosa: false,
-            id_venta: null,
-            status_http: status,
-            codigo_error: codigo,
-            latencia_ms: latencia
-        };
+            if (!puedeReintentar || intento === MAX_INTENTOS) {
+                break;
+            }
+
+            console.log(
+                `Reintentando venta ${numeroVenta}. Intento ${intento + 1} de ${MAX_INTENTOS}...`
+            );
+
+            await new Promise(resolve =>
+                setTimeout(resolve, 500 * intento)
+            );
+        }
     }
+
+    const latencia = Number(
+        (performance.now() - tiempoInicio).toFixed(2)
+    );
+
+    const status = ultimoError.response
+        ? ultimoError.response.status
+        : null;
+
+    const codigo = ultimoError.response?.data?.codigo ||
+        (status ? `HTTP_${status}` : ultimoError.code || 'ERROR_DESCONOCIDO');
+
+    const mensaje = ultimoError.response
+        ? ultimoError.response.data.mensaje
+        : ultimoError.message;
+
+    console.log(`Venta rechazada (${codigo}): ${mensaje}`);
+
+    return {
+        exitosa: false,
+        id_venta: null,
+        status_http: status,
+        codigo_error: codigo,
+        latencia_ms: latencia
+    };
 }
 
-// CALCULAR UN PERCENTIL DE LAS LATENCIAS
-function calcularPercentil(latencias, percentil) {
-    if (latencias.length === 0) {
+
+// CALCULAR UN PERCENTIL MEDIANTE NEAREST-RANK
+function percentil(valoresMs, p) {
+    if (!valoresMs.length) {
         return 0;
     }
 
-    const valoresOrdenados = [...latencias].sort((a, b) => a - b);
+    const orden = [...valoresMs].sort((a, b) => a - b);
+    const i = Math.ceil((p / 100) * orden.length) - 1;
 
-    const posicion = Math.ceil(
-        percentil * valoresOrdenados.length
-    ) - 1;
-
-    return Number(valoresOrdenados[posicion].toFixed(2));
+    return Number(orden[Math.max(0, i)].toFixed(2));
 }
 
 // EJECUTAR EL SIMULADOR
 async function iniciarSimulador() {
     validarConfiguracion();
 
-    // VALIDAR LA CONFIGURACION DE MONGODB
-    const mongoUri = process.env.MONGO_URI;
-    const mongoDatabase = process.env.MONGO_DATABASE;
-
-    if (!mongoUri || !mongoDatabase) {
-        throw new Error('No se encontraron las variables de MongoDB en backend/.env');
-    }
-
-    const mongoClient = new MongoClient(mongoUri);
-
     try {
-        // CONECTAR CON MONGODB
-        await mongoClient.connect();
-
-        const database = mongoClient.db(mongoDatabase);
-        const coleccion = database.collection('simulaciones');
-
-        console.log('Conectado a MongoDB correctamente.');
 
         // PREPARAR LA INFORMACION DE LA EJECUCION
         const random = crearGenerador(SEED);
@@ -252,7 +275,9 @@ async function iniciarSimulador() {
 
             // ENVIAR TODAS LAS VENTAS DEL LOTE SIMULTANEAMENTE
             const resultados = await Promise.all(
-                lote.map(venta => enviarVenta(venta))
+                lote.map((venta, indice) =>
+                    enviarVenta(venta, i + indice + 1)
+                )
             );
 
             // CONTABILIZAR LOS RESULTADOS
@@ -304,13 +329,21 @@ async function iniciarSimulador() {
             cambios_sin_commit: informacionGit.cambios_sin_commit,
             ventas_por_segundo,
             latencia_promedio_ms,
-            latencia_p50_ms: calcularPercentil(latencias, 0.50),
-            latencia_p95_ms: calcularPercentil(latencias, 0.95),
+            p50_ms: percentil(latencias, 50),
+            p95_ms: percentil(latencias, 95),
             errores_por_codigo
         };
 
-        // GUARDAR EL RESUMEN EN MONGODB
-        const resultadoMongo = await coleccion.insertOne(resumen);
+        // ENVIAR EL RESUMEN AL BACKEND
+        const respuestaResumen = await axios.post(
+            SUMMARY_API_URL,
+            resumen,
+            {
+                headers: {
+                    'x-api-key': SIMULADOR_API_KEY
+                }
+            }
+        );;
 
         console.log('\n====================================');
         console.log('       RESULTADOS FINALES');
@@ -321,16 +354,14 @@ async function iniciarSimulador() {
         console.log(`Tiempo total: ${duracion_ms} ms`);
         console.log(`Ventas por segundo: ${ventas_por_segundo}`);
         console.log(`Latencia promedio: ${latencia_promedio_ms} ms`);
-        console.log(`Latencia P50: ${resumen.latencia_p50_ms} ms`);
-        console.log(`Latencia P95: ${resumen.latencia_p95_ms} ms`);
+        console.log(`Latencia P50: ${resumen.p50_ms} ms`);
+        console.log(`Latencia P95: ${resumen.p95_ms} ms`);
 
-        console.log('\nResumen guardado en MongoDB.');
-        console.log(`ID de simulacion: ${resultadoMongo.insertedId}`);
+        console.log('\nResumen enviado y guardado correctamente.');
+        console.log(`ID de simulacion: ${respuestaResumen.data.id_simulacion}`);
 
     } finally {
-        // CERRAR LA CONEXION CON MONGODB
-        await mongoClient.close();
-        console.log('\nConexion con MongoDB cerrada.');
+
     }
 }
 

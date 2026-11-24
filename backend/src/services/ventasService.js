@@ -1,5 +1,6 @@
 const mysql = require('../database/mysql');
 const postgres = require('../database/postgresql');
+const crypto = require('crypto');
 
 //Crear errores https
 function crearError(status, codigo, mensaje) {
@@ -22,10 +23,96 @@ function formatearPrecio(centavos) {
     return (centavos / 100).toFixed(2);
 }
 
+// GENERAR HASH DE UNA SOLICITUD NORMALIZADA
+function generarHashSolicitud(datos) {
+
+    const solicitudNormalizada = {
+        id_cliente: datos.id_cliente,
+        id_sucursal: datos.id_sucursal,
+        productos: [...datos.productos]
+            .sort((a, b) => a.id_producto - b.id_producto)
+            .map(producto => ({
+                id_producto: producto.id_producto,
+                cantidad: producto.cantidad
+            }))
+    };
+
+    return crypto
+        .createHash('sha256')
+        .update(JSON.stringify(solicitudNormalizada))
+        .digest('hex');
+}
+
+// BUSCAR UNA VENTA MEDIANTE SU CLAVE DE IDEMPOTENCIA
+async function buscarVentaPorClave(id_sucursal, idempotencyKey) {
+
+    const resultado = await postgres.query(
+        `SELECT
+            id_venta,
+            id_sucursal,
+            total,
+            request_hash
+         FROM ventas
+         WHERE id_sucursal = $1
+         AND idempotency_key = $2`,
+        [id_sucursal, idempotencyKey]
+    );
+
+    return resultado.rows[0] || null;
+}
+
 //Procesar una venta
-async function procesarVenta(datos) {
+async function procesarVenta(datos, idempotencyKey = null) {
 
     const { id_cliente, id_sucursal, productos } = datos;
+
+    // CALCULAR EL HASH DE LA SOLICITUD
+    const hashSolicitud = idempotencyKey
+        ? generarHashSolicitud(datos)
+        : null;
+
+    // COMPROBAR SI LA VENTA YA FUE REGISTRADA
+    if (idempotencyKey) {
+
+        let ventaExistente;
+
+        try {
+            ventaExistente = await buscarVentaPorClave(
+                id_sucursal,
+                idempotencyKey
+            );
+
+        } catch (error) {
+            throw crearError(
+                503,
+                'POSTGRESQL_NO_DISPONIBLE',
+                'No fue posible verificar la clave de idempotencia.'
+            );
+        }
+
+        if (ventaExistente) {
+
+            // COMPARAR EL CONTENIDO DE LA SOLICITUD
+            if (ventaExistente.request_hash !== hashSolicitud) {
+                throw crearError(
+                    409,
+                    'IDEMPOTENCY_KEY_REUTILIZADA',
+                    'La clave de idempotencia ya fue utilizada con datos diferentes.'
+                );
+            }
+
+            // DEVOLVER LA VENTA ORIGINAL
+            return {
+                venta: {
+                    id_venta: ventaExistente.id_venta,
+                    id_sucursal: ventaExistente.id_sucursal,
+                    total: Number(ventaExistente.total)
+                },
+                eventos: 'pendientes',
+                repetida: true
+            };
+        }
+    }
 
     //Validar cliente en MySQL
     let clientes;
@@ -151,6 +238,59 @@ async function procesarVenta(datos) {
         await client.query('BEGIN');
         transaccionIniciada = true;
 
+        // BLOQUEAR SOLICITUDES SIMULTANEAS CON LA MISMA CLAVE
+        if (idempotencyKey) {
+
+            const claveBloqueo = `${id_sucursal}:${idempotencyKey}`;
+
+            await client.query(
+                `SELECT pg_advisory_xact_lock(
+                    hashtextextended($1, 0)
+                )`,
+                [claveBloqueo]
+            );
+
+            // VOLVER A COMPROBAR LA VENTA DENTRO DE LA TRANSACCION
+            const ventaExistente = await client.query(
+                `SELECT
+                    id_venta,
+                    id_sucursal,
+                    total,
+                    request_hash
+                FROM ventas
+                WHERE id_sucursal = $1
+                AND idempotency_key = $2`,
+                [id_sucursal, idempotencyKey]
+            );
+
+            if (ventaExistente.rowCount > 0) {
+
+                const ventaOriginal = ventaExistente.rows[0];
+
+                if (ventaOriginal.request_hash !== hashSolicitud) {
+                    throw crearError(
+                        409,
+                        'IDEMPOTENCY_KEY_REUTILIZADA',
+                        'La clave de idempotencia ya fue utilizada con datos diferentes.'
+                    );
+                }
+
+                await client.query('COMMIT');
+                transaccionIniciada = false;
+
+                return {
+                    venta: {
+                        id_venta: ventaOriginal.id_venta,
+                        id_sucursal: ventaOriginal.id_sucursal,
+                        total: Number(ventaOriginal.total)
+                    },
+                    eventos: 'pendientes',
+                    repetida: true
+                };
+            }
+        }
+
+
         //Validar sucursal
         const sucursal = await client.query(
             `SELECT id_sucursal
@@ -206,14 +346,21 @@ async function procesarVenta(datos) {
                 );
             }
         }
-
-        //Registrar venta
+        // REGISTRAR VENTA Y SU CLAVE DE IDEMPOTENCIA
         const ventaInsertada = await client.query(
             `INSERT INTO ventas
-                (id_cliente, id_sucursal, total, estado)
-             VALUES ($1, $2, $3, $4)
-             RETURNING id_venta, id_sucursal, total`,
-            [id_cliente, id_sucursal, total, 'completada']
+                (id_cliente, id_sucursal, total, estado,
+                idempotency_key, request_hash)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id_venta, id_sucursal, total`,
+            [
+                id_cliente,
+                id_sucursal,
+                total,
+                'completada',
+                idempotencyKey,
+                hashSolicitud
+            ]
         );
 
         const venta = ventaInsertada.rows[0];
@@ -382,7 +529,7 @@ async function procesarVenta(datos) {
 
     } catch (error) {
 
-        //Si algo falla se cancela la venta
+        // CANCELAR LA TRANSACCION SI SIGUE ACTIVA
         if (transaccionIniciada) {
             try {
                 await client.query('ROLLBACK');
@@ -392,9 +539,60 @@ async function procesarVenta(datos) {
                     rollbackError.message
                 );
             }
+
+            transaccionIniciada = false;
+        }
+
+        // VERIFICAR SI LA VENTA SE CONFIRMO A PESAR DEL ERROR
+        if (idempotencyKey) {
+
+            try {
+                const ventaRecuperada = await buscarVentaPorClave(
+                    id_sucursal,
+                    idempotencyKey
+                );
+
+                if (ventaRecuperada) {
+
+                    // COMPROBAR QUE SEA LA MISMA SOLICITUD
+                    if (ventaRecuperada.request_hash !== hashSolicitud) {
+                        throw crearError(
+                            409,
+                            'IDEMPOTENCY_KEY_REUTILIZADA',
+                            'La clave de idempotencia ya fue utilizada con datos diferentes.'
+                        );
+                    }
+
+                    console.log(
+                        `Venta ${ventaRecuperada.id_venta} recuperada mediante idempotencia.`
+                    );
+
+                    return {
+                        venta: {
+                            id_venta: ventaRecuperada.id_venta,
+                            id_sucursal: ventaRecuperada.id_sucursal,
+                            total: Number(ventaRecuperada.total)
+                        },
+                        eventos: 'pendientes',
+                        repetida: true
+                    };
+                }
+
+            } catch (errorRecuperacion) {
+
+                if (errorRecuperacion.codigo === 'IDEMPOTENCY_KEY_REUTILIZADA') {
+                    throw errorRecuperacion;
+                }
+
+                console.error(
+                    'No fue posible recuperar la venta:',
+                    errorRecuperacion.message
+                );
+            }
         }
 
         throw error;
+
 
     } finally {
 

@@ -77,6 +77,8 @@ async function crearVenta(req, res) {
         const errorValidacion = validarSolicitud(req.body);
 
         if (errorValidacion) {
+            res.locals.resultadoMetrica = 'validacion';
+
             return responderError(
                 res,
                 400,
@@ -87,17 +89,41 @@ async function crearVenta(req, res) {
 
         const { id_cliente, id_sucursal, productos } = req.body;
 
-        //Enviar datos validados
-        const resultado = await ventasService.procesarVenta({
-            id_cliente,
-            id_sucursal,
-            productos
-        });
+        // OBTENER LA CLAVE DE IDEMPOTENCIA DEL ENCABEZADO
+        const idempotencyKey = req.get('Idempotency-Key')?.trim() || null;
 
-        return res.status(201).json({
+        // VALIDAR LONGITUD DE LA CLAVE
+        if (idempotencyKey && idempotencyKey.length > 120) {
+            res.locals.resultadoMetrica = 'validacion';
+            return responderError(
+                res,
+                400,
+                'IDEMPOTENCY_KEY_INVALIDA',
+                'La clave de idempotencia no puede superar los 120 caracteres.'
+            );
+        }
+
+        // PROCESAR LA VENTA
+        const resultado = await ventasService.procesarVenta(
+            {
+                id_cliente,
+                id_sucursal,
+                productos
+            },
+            idempotencyKey
+        );
+
+        // CLASIFICAR EL RESULTADO PARA LAS METRICAS
+        res.locals.resultadoMetrica = resultado.repetida
+            ? 'repetida'
+            : 'ok';
+
+        // DEVOLVER 200 SI ES REPETIDA O 201 SI ES NUEVA
+        const status = resultado.repetida ? 200 : 201;
+
+        return res.status(status).json({
             ok: true,
-            venta: resultado.venta,
-            eventos: resultado.eventos
+            ...resultado
         });
 
     } catch (error) {
@@ -109,6 +135,16 @@ async function crearVenta(req, res) {
             'STOCK_INSUFICIENTE',
             'SUCURSAL_NO_EXISTE'
         ];
+
+        if (error.codigo === 'STOCK_INSUFICIENTE') {
+            res.locals.resultadoMetrica = 'sin_stock';
+        } else if (error.codigo === 'IDEMPOTENCY_KEY_REUTILIZADA') {
+            res.locals.resultadoMetrica = 'conflicto';
+        } else if (erroresNegocio.includes(error.codigo)) {
+            res.locals.resultadoMetrica = 'validacion';
+        } else {
+            res.locals.resultadoMetrica = 'error';
+        }
 
         if (erroresNegocio.includes(error.codigo)) {
             try {

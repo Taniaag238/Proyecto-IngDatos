@@ -1,4 +1,4 @@
-
+const { eventosPendientes } = require('../metrics/metrics');
 const postgres = require('../database/postgresql');
 const { connectMongoDB } = require('../database/mongodb');
 const { publicarEvento } = require('../services/eventosService');
@@ -35,6 +35,15 @@ async function procesarEventos() {
             LIMIT 10
             FOR UPDATE SKIP LOCKED
         `);
+
+        // Actualizar cantidad de eventos pendientes
+        const pendientes = await client.query(`
+            SELECT COUNT(*) AS cantidad
+            FROM eventos_pendientes
+            WHERE estado = 'pendiente'
+        `);
+
+        eventosPendientes.set(Number(pendientes.rows[0].cantidad));
 
         //Procesar cada evento
         for (const evento of resultado.rows) {
@@ -95,7 +104,7 @@ async function procesarEventos() {
         }
 
     } catch (error) {
-
+        eventosPendientes.set(NaN);
         if (client) {
             await client.query('ROLLBACK').catch(() => {});
         }

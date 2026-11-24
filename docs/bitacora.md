@@ -217,3 +217,165 @@ La prueba fue satisfactoria. La desconexión temporal de MongoDB no impidió reg
 No fue necesario registrar nuevamente la venta para recuperar sus eventos.
 
 **Observación:** Se comprobó la recuperación mediante reintentos, aunque queda pendiente medir y documentar formalmente los intervalos de espera progresiva del worker.
+
+---
+
+# Fase 2 — Mejoras opcionales
+
+## 13. Implementación de métricas con Prometheus
+
+Se integró la dependencia `prom-client` en el backend para recopilar métricas de funcionamiento y rendimiento.
+
+Se creó el archivo `backend/src/metrics/metrics.js`, donde se definieron las siguientes métricas:
+
+| Métrica | Tipo | Descripción |
+|---|---|---|
+| ventas_solicitudes_total | Counter | Total de solicitudes de venta clasificadas por resultado |
+| ventas_duracion_segundos | Histogram | Duración de las solicitudes de venta |
+| eventos_pendientes | Gauge | Cantidad de eventos pendientes de procesamiento |
+
+Se configuraron etiquetas de resultado para clasificar las solicitudes: `ok`, `repetida`, `conflicto`, `sin_stock`, `validacion` y `error`.
+
+También se incorporó la recopilación de métricas generales del proceso de Node.js.
+
+Se habilitó el endpoint:
+
+`GET /metrics`
+
+Este endpoint expone las métricas en el formato compatible con Prometheus.
+
+El indicador de eventos pendientes se actualiza durante los ciclos del worker Outbox. En caso de error al consultar PostgreSQL, se evita conservar un valor anterior como si fuera actual.
+
+## 14. Cálculo de percentiles en el simulador
+
+Se incorporó el cálculo de los percentiles P50 y P95 en `simulator/simulador.js`.
+
+Se utilizó el método Nearest-Rank, ordenando las latencias y seleccionando la posición correspondiente al percentil solicitado.
+
+Los resultados se incorporan al resumen de cada simulación mediante los campos:
+
+- `p50_ms`
+- `p95_ms`
+
+Se verificó que el simulador pudiera calcular y mostrar ambos valores durante su ejecución.
+
+## 15. Endpoint protegido para registrar simulaciones
+
+Se implementó el endpoint:
+
+`POST /api/simulaciones/resumen`
+
+Se agregó un middleware de autenticación mediante una clave API enviada en el encabezado `x-api-key`.
+
+La clave se configura mediante la variable de entorno `SIMULADOR_API_KEY`, evitando incluir credenciales directamente en el código fuente.
+
+Se realizaron las siguientes validaciones:
+
+- Comprobación de la clave de acceso.
+- Validación de los campos numéricos del resumen.
+- Comprobación de que las ventas exitosas y fallidas coincidan con el total.
+- Validación de que P50 no sea mayor que P95.
+- Límite de tamaño de 16 KB para las solicitudes JSON.
+
+Los resúmenes se almacenan en la colección `simulaciones` de MongoDB.
+
+Se modificó el simulador para enviar sus resultados al backend mediante este endpoint, eliminando su conexión directa con MongoDB.
+
+Se comprobó el funcionamiento mediante una solicitud autorizada y una ejecución completa del simulador.
+
+## 16. Implementación de idempotencia en las ventas
+
+Se incorporó un mecanismo de idempotencia para evitar que una misma solicitud de venta se registre más de una vez cuando se repite su envío.
+
+La funcionalidad utiliza el encabezado:
+
+`Idempotency-Key`
+
+Se agregaron los siguientes campos a la tabla particionada `ventas`:
+
+- `idempotency_key`: identifica la solicitud.
+- `request_hash`: almacena el hash SHA-256 del contenido normalizado de la solicitud.
+
+Se agregó una restricción de unicidad sobre la combinación de sucursal y clave de idempotencia:
+
+`UNIQUE (id_sucursal, idempotency_key)`
+
+También se creó la migración:
+
+`databases/postgresql/migrations/agregar_idempotencia_ventas.sql`
+
+La migración se ejecutó correctamente y se verificó la conservación de las cinco particiones de ventas.
+
+El servicio de ventas calcula el hash del contenido normalizado y comprueba si la clave ya fue utilizada.
+
+El comportamiento implementado es:
+
+- Una clave nueva permite registrar una venta.
+- Una clave repetida con el mismo contenido devuelve la venta original.
+- Una clave repetida con contenido diferente genera un conflicto HTTP 409.
+- Las solicitudes sin clave conservan el comportamiento anterior.
+- Las solicitudes simultáneas con la misma clave no generan ventas ni eventos duplicados.
+
+La lógica utiliza bloqueos transaccionales y comprobaciones posteriores a errores para atender posibles colisiones o resultados de confirmación ambiguos.
+
+## 17. Adaptación del simulador para idempotencia y reintentos
+
+Se modificó `simulator/simulador.js` para generar un identificador único por ejecución y una clave de idempotencia diferente para cada venta.
+
+Cuando ocurre un error de red, timeout o respuesta HTTP 5xx, el simulador puede realizar hasta tres intentos.
+
+Los reintentos conservan la misma clave de idempotencia de la solicitud original.
+
+Se configuró un timeout de 10 segundos y esperas progresivas entre intentos.
+
+Los errores HTTP 4xx no se reintentan, ya que normalmente representan errores de validación o conflictos que requieren corregir la solicitud.
+
+## 18. Pruebas de idempotencia
+
+Se realizaron pruebas para verificar el comportamiento del mecanismo:
+
+| Escenario | Resultado |
+|---|---|
+| Repetición de una solicitud con el mismo contenido | Se recuperó la venta original |
+| Misma clave con contenido diferente | HTTP 409 |
+| Dos solicitudes simultáneas con la misma clave | Una venta registrada y una respuesta repetida |
+| Reutilización de la clave en otra sucursal | Permitida |
+| Solicitud sin clave de idempotencia | Funcionamiento normal |
+| Repetición después de reiniciar el backend | Se recuperó la venta original |
+
+Durante la prueba de concurrencia se verificó que las dos solicitudes devolvieran el mismo identificador de venta y que el inventario disminuyera únicamente una vez.
+
+También se comprobó que se generara un solo conjunto de tres eventos Outbox para esa venta.
+
+La prueba posterior al reinicio devolvió HTTP 200 y el identificador de la venta original, con `repetida: true`.
+
+## 19. Prueba del simulador con las mejoras de la fase 2
+
+Se ejecutó el siguiente comando:
+
+`node simulator\simulador.js 10 1 2026`
+
+Resultados obtenidos:
+
+| Métrica | Resultado |
+|---|---:|
+| Ventas exitosas | 10 |
+| Ventas fallidas | 0 |
+| Total procesadas | 10 |
+| Duración | 490.49 ms |
+| Ventas por segundo | 20.39 |
+| Latencia promedio | 48.33 ms |
+| P50 | 35.32 ms |
+| P95 | 133.84 ms |
+
+El resumen se envió correctamente al endpoint protegido y se almacenó en MongoDB.
+
+## 20. Conclusión de la fase 2
+
+Durante la segunda fase se incorporaron mecanismos adicionales de observabilidad, protección y confiabilidad.
+
+Se integraron métricas compatibles con Prometheus, cálculo de percentiles, registro protegido de simulaciones e idempotencia en las operaciones de venta.
+
+Las pruebas realizadas comprobaron la repetición segura de solicitudes, el comportamiento ante solicitudes simultáneas, la conservación de la información después de reiniciar el backend y la integración del simulador con el nuevo endpoint.
+
+Queda pendiente completar la revisión integral de los cambios, verificar las evidencias y preparar la entrega final del proyecto.
