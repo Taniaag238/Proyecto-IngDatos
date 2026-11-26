@@ -1,0 +1,41 @@
+datadir="/var/lib/proxysql"
+
+admin_variables=
+{
+    admin_credentials="admin:admin"
+    mysql_ifaces="0.0.0.0:6032"
+}
+
+mysql_variables=
+{
+    threads=4
+    max_connections=2048
+    interfaces="0.0.0.0:6033"
+    monitor_enabled=true
+    monitor_connect_interval=2000
+    monitor_ping_interval=2000
+    monitor_read_only_interval=1500
+    monitor_groupreplication_healthcheck_interval=2000
+}
+
+mysql_servers=
+(
+    {
+        address="mysql-test-1"
+        port=3306
+        hostgroup=10
+        max_connections=100
+    },
+    {
+        address="mysql-test-2"
+        port=3306
+        hostgroup=30
+        max_connections=100
+    },
+    {
+        address="mysql-test-3"
+        port=3306
+        hostgroup=30
+        max_connections=100
+    }
+)

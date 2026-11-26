@@ -1,0 +1,156 @@
+name: ventas-mysql-cluster-local
+
+services:
+
+  mysql-test-1:
+    image: mysql:8.4
+    container_name: mysql-test-1
+    hostname: mysql-test-1
+    restart: unless-stopped
+
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+
+    command:
+      - --server-id=1
+      - --report-host=mysql-test-1
+      - --bind-address=0.0.0.0
+      - --log-bin=mysql-bin
+      - --binlog-format=ROW
+      - --log-replica-updates=ON
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --plugin-load-add=group_replication.so
+      - --loose-group-replication-group-name=${MYSQL_GROUP_UUID}
+      - --loose-group-replication-start-on-boot=OFF
+      - --loose-group-replication-bootstrap-group=OFF
+      - --loose-group-replication-single-primary-mode=ON
+      - --loose-group-replication-enforce-update-everywhere-checks=OFF
+      - --loose-group-replication-communication-stack=XCOM
+      - --loose-group-replication-local-address=mysql-test-1:33061
+      - --loose-group-replication-group-seeds=mysql-test-1:33061,mysql-test-2:33061,mysql-test-3:33061
+      - --loose-group-replication-ip-allowlist=AUTOMATIC
+      - --loose-group-replication-autorejoin-tries=3
+      - --loose-group-replication-exit-state-action=READ_ONLY
+      - --loose-group-replication-recovery-get-public-key=ON
+      - --default-storage-engine=InnoDB
+
+    ports:
+      - "127.0.0.1:3311:3306"
+
+    volumes:
+      - mysql_test_1_data:/var/lib/mysql
+
+    networks:
+      - mysql_cluster_network
+
+  mysql-test-2:
+    image: mysql:8.4
+    container_name: mysql-test-2
+    hostname: mysql-test-2
+    restart: unless-stopped
+
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+
+    command:
+      - --server-id=2
+      - --report-host=mysql-test-2
+      - --bind-address=0.0.0.0
+      - --log-bin=mysql-bin
+      - --binlog-format=ROW
+      - --log-replica-updates=ON
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --plugin-load-add=group_replication.so
+      - --loose-group-replication-group-name=${MYSQL_GROUP_UUID}
+      - --loose-group-replication-start-on-boot=OFF
+      - --loose-group-replication-bootstrap-group=OFF
+      - --loose-group-replication-single-primary-mode=ON
+      - --loose-group-replication-enforce-update-everywhere-checks=OFF
+      - --loose-group-replication-communication-stack=XCOM
+      - --loose-group-replication-local-address=mysql-test-2:33061
+      - --loose-group-replication-group-seeds=mysql-test-1:33061,mysql-test-2:33061,mysql-test-3:33061
+      - --loose-group-replication-ip-allowlist=AUTOMATIC
+      - --loose-group-replication-autorejoin-tries=3
+      - --loose-group-replication-exit-state-action=READ_ONLY
+      - --loose-group-replication-recovery-get-public-key=ON
+      - --default-storage-engine=InnoDB
+
+    ports:
+      - "127.0.0.1:3312:3306"
+
+    volumes:
+      - mysql_test_2_data:/var/lib/mysql
+
+    networks:
+      - mysql_cluster_network
+
+  mysql-test-3:
+    image: mysql:8.4
+    container_name: mysql-test-3
+    hostname: mysql-test-3
+    restart: unless-stopped
+
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+
+    command:
+      - --server-id=3
+      - --report-host=mysql-test-3
+      - --bind-address=0.0.0.0
+      - --log-bin=mysql-bin
+      - --binlog-format=ROW
+      - --log-replica-updates=ON
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --plugin-load-add=group_replication.so
+      - --loose-group-replication-group-name=${MYSQL_GROUP_UUID}
+      - --loose-group-replication-start-on-boot=OFF
+      - --loose-group-replication-bootstrap-group=OFF
+      - --loose-group-replication-single-primary-mode=ON
+      - --loose-group-replication-enforce-update-everywhere-checks=OFF
+      - --loose-group-replication-communication-stack=XCOM
+      - --loose-group-replication-local-address=mysql-test-3:33061
+      - --loose-group-replication-group-seeds=mysql-test-1:33061,mysql-test-2:33061,mysql-test-3:33061
+      - --loose-group-replication-ip-allowlist=AUTOMATIC
+      - --loose-group-replication-autorejoin-tries=3
+      - --loose-group-replication-exit-state-action=READ_ONLY
+      - --loose-group-replication-recovery-get-public-key=ON
+      - --default-storage-engine=InnoDB
+
+    ports:
+      - "127.0.0.1:3313:3306"
+
+    volumes:
+      - mysql_test_3_data:/var/lib/mysql
+
+    networks:
+      - mysql_cluster_network
+
+  proxysql:
+    image: proxysql/proxysql:3.0.2
+    container_name: ventas-proxysql
+    hostname: ventas-proxysql
+    restart: unless-stopped
+
+    ports:
+      - "127.0.0.1:6032:6032"
+      - "127.0.0.1:6033:6033"
+
+    volumes:
+      - ../proxysql/proxysql.cnf:/etc/proxysql.cnf:ro
+      - proxysql_data:/var/lib/proxysql
+
+    networks:
+      - mysql_cluster_network
+
+volumes:
+  mysql_test_1_data:
+  mysql_test_2_data:
+  mysql_test_3_data:
+  proxysql_data:
+
+networks:
+  mysql_cluster_network:
+    driver: bridge
