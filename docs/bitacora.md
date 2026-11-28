@@ -379,3 +379,90 @@ Se integraron métricas compatibles con Prometheus, cálculo de percentiles, reg
 Las pruebas realizadas comprobaron la repetición segura de solicitudes, el comportamiento ante solicitudes simultáneas, la conservación de la información después de reiniciar el backend y la integración del simulador con el nuevo endpoint.
 
 Queda pendiente completar la revisión integral de los cambios, verificar las evidencias y preparar la entrega final del proyecto.
+
+## 21. Prueba local de failover con MySQL y ProxySQL
+
+La prueba comenzó el 28 de noviembre de 2026 a las 00:13:58 UTC (27 de noviembre en Ciudad de México). Se utilizaron MySQL 8.4.11, ProxySQL 3.0.2 y los volúmenes existentes de los tres nodos y del proxy.
+
+### Estado inicial y recuperación del grupo
+
+Los contenedores estaban encendidos y los tres miembros de Group Replication estaban `OFFLINE`. El arranque automático del grupo estaba deshabilitado. Los tres nodos tenían el mismo GTID ejecutado, `ce8b1a12-ecf6-4877-8188-a144a968f98a:1-20:1000001`. Al restar los GTID ejecutados de los recibidos en `group_replication_applier`, el resultado fue vacío en los tres nodos.
+
+Con los conjuntos equivalentes, se recuperó el grupo desde `mysql-test-1` con bootstrap temporal, se desactivó el ajuste inmediatamente y se incorporaron los otros dos nodos. Los tres quedaron `ONLINE`. En MySQL se verificaron los usuarios `replicador`, `proxysql_monitor` y `ventas_app`. Desde el interior del contenedor de ProxySQL se confirmaron el monitor activo, SSL hacia MySQL, los hostgroups 10/20/30/40, un máximo de un escritor y `ventas_app` con hostgroup 10. El pool del backend leyó 54 000 registros a través de `127.0.0.1:6033` y confirmó a `mysql-test-1` como destino.
+
+### Conmutación, escritura y reincorporación
+
+| Evidencia | Resultado |
+|---|---|
+| Elección observada desde el inicio de la orden de parada | `mysql-test-3` a los 3,43 s |
+| Primera conexión nueva del pool confirmada en el nuevo primario | 4,46 s desde el mismo origen de tiempo, aproximadamente 1,03 s después de observar la elección |
+| Hostgroup 10 tras la conmutación | `mysql-test-3`, `ONLINE` |
+| Escritura por `127.0.0.1:6033` | Una categoría de prueba con ID `-20261127`, confirmada en los dos nodos activos |
+| Reincorporación | `mysql-test-1` volvió como `SECONDARY` y recibió la categoría por recuperación incremental |
+| Limpieza | Una fila eliminada vía ProxySQL y cero filas con ese ID en cada nodo |
+
+Los tiempos son observaciones por sondeo desde el inicio de la orden de parada. La primera espera al arrancar el contenedor antiguo se agotó antes de que MySQL aceptara conexiones. Tras esperar al servidor se ejecutó `START GROUP_REPLICATION` y el nodo volvió a `ONLINE`. Al final quedaron un primario (`mysql-test-3`) y dos secundarios, con igual GTID ejecutado en todos (`ce8b1a12-ecf6-4877-8188-a144a968f98a:1-22:1000001`).
+
+| Tabla | Filas en cada nodo | `CHECKSUM TABLE … EXTENDED` en los tres nodos |
+|---|---:|---:|
+| categorias | 1 000 | 1850072196 |
+| proveedores | 1 000 | 3030758824 |
+| clientes | 22 000 | 3126403535 |
+| clientes_contacto | 22 000 | 2652333598 |
+| productos | 8 000 | 1591396420 |
+
+Se midió la recuperación de conexiones nuevas. La prueba no midió qué sucede con una transacción que ya estaba en curso al detener el primario.
+
+### Venta de extremo a extremo después del failover
+
+Se inició una instancia temporal de la API en localhost con el pool existente apuntando a `127.0.0.1:6033`. El destino MySQL comprobado fue `mysql-test-3`. Se solicitó una unidad del producto 1 para el cliente 15 en la sucursal 1, con precio de catálogo de $1 587,72.
+
+| Verificación | Resultado |
+|---|---|
+| Primera solicitud | HTTP 201, venta `6115`, total $1 587,72 |
+| Mismo cuerpo y misma `Idempotency-Key` | HTTP 200, venta `6115`, `repetida: true` |
+| Misma clave con cantidad distinta | HTTP 409, `IDEMPOTENCY_KEY_REUTILIZADA` |
+| PostgreSQL | Una venta, un detalle y existencias de 38 a 37 |
+| Outbox y MongoDB | `venta:6115:1:creada`, `venta:6115:1:inventario` y `venta:6115:1:registrada` quedaron procesados, con exactamente un documento por evento en su colección |
+
+La primera verificación de MongoDB agotó el límite de ciclos previsto porque había eventos anteriores en cola. Se continuó con el worker existente hasta verificar los tres eventos, sin enviar otra venta. La venta 6115 y sus eventos quedaron como evidencia de la prueba.
+
+## 22. Instalación reproducible de MySQL y ProxySQL
+
+Se probó el script `docker/local-cluster/cluster.ps1` desde Windows con Docker Desktop, MySQL 8.4.11 y ProxySQL 3.0.2. El proyecto de validación `ventas-mysql-fase3-limpio` utilizó tres contenedores MySQL en los puertos 23311–23313, ProxySQL en 26032–26033, una red propia y cuatro volúmenes nuevos. El clúster original siguió atendiendo por el puerto 6033 con sus volúmenes originales.
+
+La protección de bootstrap rechazó el primer conjunto de volúmenes nuevos. La imagen importaba las tablas de zonas horarias antes de arrancar el servidor principal y generaba cinco GTID con el UUID local de cada nodo. El Compose del catálogo se ajustó para omitir esa importación. La segunda instalación usó otro proyecto y volúmenes nuevos. Los volúmenes de ambas pruebas se conservaron.
+
+| Verificación | Resultado |
+|---|---|
+| Bootstrap e incorporación | Tres miembros `ONLINE`, con `mysql-test-1` como primario inicial |
+| ProxySQL | Usuario de aplicación autenticado, monitor activo, hostgroup 10 apuntando al primario y `use_ssl=1` en los tres destinos |
+| Carga por el puerto 26033 | 54 000 filas y cero incidencias en las comprobaciones de integridad del seed |
+| Catálogo replicado | Conteos 1 000 / 1 000 / 22 000 / 22 000 / 8 000, los cinco checksums iguales y GTID `e6223114-04d0-4819-b080-c4f6e47f7dce:1-12` en los tres nodos |
+| Repetición de `Initialize` y `Seed` | Los conteos, checksums y GTID se conservaron |
+
+La verificación inicial de la carga agotó la espera de 30 s antes de que el secundario aplicara la transacción del seed. Los tres nodos alcanzaron el mismo GTID y la verificación posterior confirmó los datos. El script ahora espera hasta cinco minutos para que cada nodo alcance el GTID del primario antes de comparar.
+
+### Transacción abierta durante la caída del primario
+
+El 28 de noviembre de 2026 a las 00:51:49 UTC se abrió una transacción por ProxySQL y se insertó la categoría de prueba `-20261128` sin ejecutar `COMMIT`. La fila era visible desde esa conexión y estaba ausente en una segunda sesión.
+
+Se detuvo `mysql-test-1` de forma controlada. A los 2,804 s desde el inicio de la parada, una conexión nueva por el mismo puerto 26033 llegó a `mysql-test-2` con escritura habilitada. El intento de `COMMIT` en la conexión original falló en `mysql2` con `Can't add new command when connection is in closed state`. La consulta al nuevo primario encontró cero filas con el ID de prueba. La conmutación restableció las conexiones nuevas y la transacción abierta quedó sin confirmar.
+
+`Recover` reincorporó a `mysql-test-1` como secundario. Cada nodo devolvió cero filas para el ID `-20261128` y el mismo conjunto GTID que se registró antes de la parada.
+
+### Reinicio completo
+
+Se detuvo y se volvió a iniciar el proyecto aislado con sus mismos volúmenes. Con los tres servidores fuera del grupo, `Initialize` rechazó el bootstrap porque detectó GTID existentes. `Recover` leyó los conjuntos ejecutados y recibidos de los tres nodos y encontró un conjunto completo en `mysql-test-1`. El grupo volvió a quedar con tres miembros `ONLINE`, ProxySQL dirigió las conexiones a ese primario y el catálogo conservó los 54 000 registros, con los mismos GTID y checksums.
+
+Al detener el entorno aislado al final con la espera predeterminada de Compose, los tres MySQL salieron con código 137. El README incluye una espera explícita de 120 s para el apagado. Se conservaron los cuatro volúmenes del entorno y se comprobó que el clúster original seguía con tres miembros `ONLINE`.
+
+### Revisión final del apagado
+
+En los tres contenedores que salieron con código 137, Docker registró `OOMKilled=false` y una espera efectiva de 1 s. Los eventos muestran primero `SIGTERM` y después `SIGKILL`. Los logs de MySQL registraron el inicio del apagado. La terminación forzada se debió a la espera de parada insuficiente.
+
+Se configuró `stop_grace_period: 120s` en los tres servicios MySQL. Para aplicar el cambio, se recrearon exclusivamente los contenedores del proyecto `ventas-mysql-fase3-limpio` con los mismos volúmenes. En la recuperación inicial se observó un estado transitorio del fundador después de `START GROUP_REPLICATION`. El script ahora espera a que el fundador esté `ONLINE`, sea el único integrante de su vista y tenga escritura habilitada. Si ese arranque ya se completó, una nueva ejecución de `Recover` puede incorporar los dos nodos `OFFLINE` sin repetir el bootstrap.
+
+El 28 de noviembre de 2026 a las 01:07:40 UTC se ejecutó `docker compose stop --timeout 120` en el proyecto aislado. Compose tardó **20,73 s** en completar la parada. Docker registró `SIGTERM` y salida `0` para cada MySQL, con `OOMKilled=false`. Los tres logs incluyeron `Received SHUTDOWN` y `Shutdown complete`. ProxySQL también salió con código `0`.
+
+Tras ejecutar `docker compose start` y `cluster.ps1 -Action Recover`, los tres nodos volvieron a `ONLINE`. ProxySQL recuperó el hostgroup 10 con `mysql-test-1` como escritor y los tres nodos conservaron los **54 000 registros**, los cinco checksums y el GTID `e6223114-04d0-4819-b080-c4f6e47f7dce:1-12`. Las pruebas operaron exclusivamente sobre el proyecto aislado y conservaron sus volúmenes.
