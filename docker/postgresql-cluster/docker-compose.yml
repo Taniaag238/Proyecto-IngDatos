@@ -1,0 +1,81 @@
+x-postgres: &postgres
+  image: postgres:17
+  restart: "no"
+  stop_grace_period: 120s
+  environment: &pg-environment
+    POSTGRES_USER: pgadmin
+    POSTGRES_DB: ventas_operaciones
+    POSTGRES_PASSWORD: ${PG_ADMIN_PASSWORD:?required}
+    POSTGRES_INITDB_ARGS: --data-checksums --auth-host=scram-sha-256
+    PG_APP_PASSWORD: ${PG_APP_PASSWORD:?required}
+    PG_REPL_PASSWORD: ${PG_REPL_PASSWORD:?required}
+    PG_CHECK_PASSWORD: ${PG_CHECK_PASSWORD:?required}
+    PG_CLIENT_CIDR: ${PG_CLIENT_CIDR:?required}
+    PG_REPLICATION_CIDR: ${PG_REPLICATION_CIDR:?required}
+    PG_REWIND_CIDR: ${PG_REWIND_CIDR:?required}
+    PG_NODE1_HOST: ${PG_NODE1_HOST:-pg1}
+    PG_NODE2_HOST: ${PG_NODE2_HOST:-pg2}
+    PG_NODE1_PORT: ${PG_NODE1_PORT:-5432}
+    PG_NODE2_PORT: ${PG_NODE2_PORT:-5432}
+    PG_WAL_KEEP_MB: ${PG_WAL_KEEP_MB:-128}
+  entrypoint: [bash, /lab/node.sh]
+  command: [start]
+  networks: [lab]
+
+services:
+  pg1:
+    <<: *postgres
+    environment:
+      <<: *pg-environment
+      PG_NODE: pg1
+      PGPORT: ${PG_NODE1_PORT:-5432}
+    ports: ["${PG_BIND_ADDRESS:-127.0.0.1}:${PG1_PUBLISHED_PORT:-15431}:${PG_NODE1_PORT:-5432}"]
+    volumes:
+      - pg1:/var/lib/postgresql/data
+      - ./config:/lab:ro
+      - "${PG_STATE_DIR:?required}:/authority:ro"
+      - ../../databases/postgresql/schema.sql:/schema.sql:ro
+      - ./config/init.sh:/docker-entrypoint-initdb.d/10-lab.sh:ro
+
+  pg2:
+    <<: *postgres
+    environment:
+      <<: *pg-environment
+      PG_NODE: pg2
+      PGPORT: ${PG_NODE2_PORT:-5432}
+    ports: ["${PG_BIND_ADDRESS:-127.0.0.1}:${PG2_PUBLISHED_PORT:-15432}:${PG_NODE2_PORT:-5432}"]
+    volumes:
+      - pg2:/var/lib/postgresql/data
+      - ./config:/lab:ro
+      - "${PG_STATE_DIR:?required}:/authority:ro"
+      - ../../databases/postgresql/schema.sql:/schema.sql:ro
+      - ./config/init.sh:/docker-entrypoint-initdb.d/10-lab.sh:ro
+
+  haproxy:
+    init: true
+    build:
+      context: ./config
+      dockerfile: HAProxy.Dockerfile
+    environment:
+      PG_NODE1_HOST: ${PG_NODE1_HOST:-pg1}
+      PG_NODE2_HOST: ${PG_NODE2_HOST:-pg2}
+      PG_NODE1_PORT: ${PG_NODE1_PORT:-5432}
+      PG_NODE2_PORT: ${PG_NODE2_PORT:-5432}
+      PG_CHECK_PASSWORD: ${PG_CHECK_PASSWORD:?required}
+    ports: ["${PG_BIND_ADDRESS:-127.0.0.1}:${PG_WRITER_PORT:-15433}:5432"]
+    volumes:
+      - "${PG_STATE_DIR:?required}:/authority:ro"
+      - ./config/haproxy.cfg:/etc/haproxy/haproxy.cfg:ro
+    networks: [lab]
+
+networks:
+  lab:
+    ipam:
+      config:
+        - subnet: ${PG_DOCKER_SUBNET:?required}
+
+volumes:
+  pg1:
+    name: ${PG1_VOLUME:-${COMPOSE_PROJECT_NAME}_pg1}
+  pg2:
+    name: ${PG2_VOLUME:-${COMPOSE_PROJECT_NAME}_pg2}

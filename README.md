@@ -97,9 +97,50 @@ docker @composeArgs start
 
 Con dos miembros `ONLINE`, `Recover` reincorpora el tercero iniciado. Si los tres están `OFFLINE`, compara los GTID ejecutados y los recibidos en el canal de aplicación. Solo arranca un fundador si su conjunto combinado incluye los de todos los nodos y espera a que acepte escrituras antes de incorporar los secundarios. Si un arranque anterior dejó un solo miembro `ONLINE`, la recuperación continúa cuando ese nodo se ve a sí mismo como único integrante del grupo y es un primario habilitado para escritura. Si falta un contenedor o el grupo no cumple esas condiciones, revisa el estado antes de reintentar. Para un nodo que ya recibió tráfico, conserva el mismo volumen. Consulta la bitácora para ver el resultado de las pruebas de conmutación.
 
+## Laboratorio local de replicación de PostgreSQL 17
+
+Desde PowerShell y Docker Desktop en modo Linux, copia `docker/postgresql-cluster/.env.example` a `docker/postgresql-cluster/.env.local`. Asigna contraseñas distintas a `PG_ADMIN_PASSWORD`, `PG_APP_PASSWORD`, `PG_REPL_PASSWORD` y `PG_CHECK_PASSWORD`. Usa de 12 a 128 caracteres del conjunto `A–Z a–z 0–9 _ ! @ % + = . , -`. Para ejecutar otro laboratorio, asigna un nombre de proyecto, puertos, subred y directorio `PG_STATE_DIR` exclusivos.
+
+```powershell
+$pgEnv = 'docker/postgresql-cluster/.env.local'
+$pgProject = 'ventas-pg-repl-local'
+$pgArgs = @{ EnvFile = $pgEnv; Project = $pgProject }
+& docker/postgresql-cluster/cluster.ps1 @pgArgs -Action Initialize
+& docker/postgresql-cluster/cluster.ps1 @pgArgs -Action Verify
+```
+
+`Initialize` aplica el esquema existente al primario vacío, crea el secundario con `pg_basebackup -R` y levanta HAProxy. Para cargar el catálogo histórico usa `npm.cmd run seed:postgres` desde `backend/` con un primario vacío. Ajusta en el entorno de ese proceso `POSTGRES_HOST=127.0.0.1`, `POSTGRES_PORT` al valor de `PG_WRITER_PORT`, `POSTGRES_USER=ventas_app`, `POSTGRES_PASSWORD` al valor de `PG_APP_PASSWORD` y `POSTGRES_DATABASE=ventas_operaciones`. Configura también `MYSQL_*` para consultar el catálogo de 8 000 productos. Omite `--reset`. La misma configuración PostgreSQL conecta la API a HAProxy.
+
+Antes de promover, pausa las escrituras para una conmutación planificada y usa `Verify` para esperar el LSN del primario en el secundario. Una caída imprevista puede perder commits aún ausentes del WAL recibido por el secundario. HAProxy comprueba por SQL `pg_is_in_recovery()` y `transaction_read_only` además de la autorización.
+
+**La replicación es asíncrona, la promoción es manual y HAProxy es un punto único de fallo.** Si HAProxy cae, el backend pierde su endpoint aunque el primario siga operativo. El pool registra los fallos de conexiones ociosas. Los errores de consultas y transacciones activas se devuelven al llamador, que decide cómo recuperarse.
+
+```powershell
+& docker/postgresql-cluster/cluster.ps1 @pgArgs -Action Promote -Target pg2
+& docker/postgresql-cluster/cluster.ps1 @pgArgs -Action Rewind
+& docker/postgresql-cluster/cluster.ps1 @pgArgs -Action Verify
+& docker/postgresql-cluster/cluster.ps1 @pgArgs -Action Stop
+& docker/postgresql-cluster/cluster.ps1 @pgArgs -Action Start
+```
+
+`Promote` detiene HAProxy y el escritor anterior, verifica que ese contenedor esté detenido, revoca su autorización, promueve al candidato y reabre el acceso por el mismo puerto. Si se interrumpe después de revocar la autorización, conserva el estado cerrado, comprueba los dos roles y aísla el antiguo primario antes de intervenir. El archivo `writer` puede autorizar solo al nodo que se haya comprobado como primario después de resolver el incidente. Conserva el directorio de autoridad junto con los volúmenes.
+
+`Rewind` reincorpora el antiguo escritor. Si falla por falta de WAL, conserva el volumen y el directorio de autoridad. Mantén el primario actual operativo. En el mismo archivo de entorno, asigna un nombre de volumen nuevo al nodo que será secundario, mediante `PG1_VOLUME` o `PG2_VOLUME`. El nombre debe empezar por el proyecto y un guion bajo. Por ejemplo, usa `PG1_VOLUME=ventas-pg-repl-local_pg1_replacement` si `pg2` es el primario. Ejecuta los comandos con ese archivo de entorno, también en arranques posteriores.
+
+```powershell
+& docker/postgresql-cluster/cluster.ps1 @pgArgs -Action Clone
+& docker/postgresql-cluster/cluster.ps1 @pgArgs -Action Verify
+```
+
+La copia base exige un volumen vacío. Un segundo `Clone` con el mismo volumen de destino es rechazado. `Stop` da hasta 120 s para el cierre y `Start` verifica la réplica y el endpoint. Los resultados de la recuperación y el reinicio están en la [bitácora](docs/bitacora.md).
+
+El laboratorio usa SCRAM-SHA-256, checksums de datos y `wal_log_hints`. Mantiene WAL reciente con `PG_WAL_KEEP_MB`, configura `max_wal_size=512MB` como objetivo de checkpoint y prescinde de slots persistentes. Si se recicla WAL requerido por un nodo ausente, habrá que volver a clonarlo.
+
+Los identificadores lógicos `pg1` y `pg2` representan inicialmente PC2 y PC3. `PG_NODE1_HOST`, `PG_NODE2_HOST` y sus puertos permiten usar DNS o IPv4 accesibles entre equipos. Los tres CIDR se aplican al inicializar `pg_hba.conf`. En un volumen existente, cambiar las reglas requiere actualizar y recargar ese archivo. Si cambia la dirección del primario para una réplica existente, actualiza también su `primary_conninfo` y su archivo de contraseña. El script PowerShell opera en un solo motor Docker. La promoción física requerirá adaptar el aislamiento del escritor y la distribución de la autorización entre equipos.
+
 ## Estado actual
 
-El backend registra ventas e inventario en PostgreSQL, usa el catálogo de MySQL y publica eventos en MongoDB mediante Outbox. El repositorio incluye seeds, un simulador y un clúster local de MySQL con ProxySQL. El despliegue en tres computadoras, la replicación de PostgreSQL, el sharding de MongoDB y el monitoreo centralizado siguen pendientes.
+El backend registra ventas e inventario en PostgreSQL, usa el catálogo de MySQL y publica eventos en MongoDB mediante Outbox. El repositorio incluye seeds, un simulador y laboratorios locales de MySQL con ProxySQL y PostgreSQL con HAProxy. El despliegue en tres computadoras, el sharding de MongoDB y el monitoreo centralizado siguen pendientes.
 
 ## Integrantes
 

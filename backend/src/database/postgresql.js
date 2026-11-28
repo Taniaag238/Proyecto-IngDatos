@@ -8,4 +8,8 @@ const pool = new Pool({
     database: process.env.POSTGRES_DATABASE
 });
 
+pool.on('error', (error) => {
+    console.error('[PostgreSQL] Idle connection closed:', error.message);
+});
+
 module.exports = pool;

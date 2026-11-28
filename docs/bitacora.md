@@ -466,3 +466,65 @@ Se configuró `stop_grace_period: 120s` en los tres servicios MySQL. Para aplica
 El 28 de noviembre de 2026 a las 01:07:40 UTC se ejecutó `docker compose stop --timeout 120` en el proyecto aislado. Compose tardó **20,73 s** en completar la parada. Docker registró `SIGTERM` y salida `0` para cada MySQL, con `OOMKilled=false`. Los tres logs incluyeron `Received SHUTDOWN` y `Shutdown complete`. ProxySQL también salió con código `0`.
 
 Tras ejecutar `docker compose start` y `cluster.ps1 -Action Recover`, los tres nodos volvieron a `ONLINE`. ProxySQL recuperó el hostgroup 10 con `mysql-test-1` como escritor y los tres nodos conservaron los **54 000 registros**, los cinco checksums y el GTID `e6223114-04d0-4819-b080-c4f6e47f7dce:1-12`. Las pruebas operaron exclusivamente sobre el proyecto aislado y conservaron sus volúmenes.
+
+## 23. Streaming Replication de PostgreSQL
+
+El laboratorio `ventas-pg-repl-test` usa PostgreSQL 17.11, HAProxy 3.0.11, los puertos 15431–15433, una red independiente y dos volúmenes PostgreSQL propios. La instalación aplicó el esquema existente y creó el secundario con `pg_basebackup -R`. El catálogo MySQL se consultó a través de la implementación existente. Las pruebas de Outbox usan un MongoDB temporal con su propio volumen y puerto 27029.
+
+En el primario se comprobaron `data_checksums=on`, `wal_log_hints=on` y `wal_keep_size=128MB`. Tanto la aplicación como el monitor y el usuario de replicación tienen verificador SCRAM-SHA-256. Solo `pgrepl` tiene el atributo de replicación y los tres roles carecen de superusuario.
+
+Se pausó la aplicación de WAL en el secundario con `pg_wal_replay_pause()` y se insertó una sucursal de prueba. `pg_stat_replication` mostró `streaming|async` y 6 328 bytes de diferencia entre el WAL confirmado en el primario y el aplicado en la réplica. La fila estaba ausente en el secundario. Tras `pg_wal_replay_resume()`, la primera comprobación a los 549 ms confirmó el LSN y la fila. Después se retiró el marcador. Esta prueba mide retraso de aplicación. Si el primario cae antes de que el secundario reciba un commit, ese commit puede perderse al promoverlo.
+
+HAProxy 3.0.11 rechazó la directiva `init-state` en el primer arranque. La configuración resultante comprueba por SQL el escritor autorizado antes de abrir el puerto, deshabilita el otro destino y vuelve a comprobar el rol durante la operación.
+
+Se ejecutó `npm run seed:postgres` por HAProxy sin `--reset`. La carga confirmó **70 163 filas** y las pruebas de integridad del seed devolvieron los valores esperados. Tras aplicar el LSN `0/3D0B908`, los conteos y las huellas coincidieron en ambos nodos.
+
+| Tabla | Filas tras el seed |
+|---|---:|
+| sucursales | 5 |
+| inventario | 40 000 |
+| ventas | 5 000 |
+| detalle_venta | 12 579 |
+| movimientos_inventario | 12 579 |
+| eventos_pendientes | 0 |
+
+Las cinco particiones de ventas quedaron con 1 002, 1 020, 975, 977 y 1 026 filas. Una verificación preliminar detectó avance del WAL durante la lectura. La verificación actual toma una instantánea de solo lectura por nodo y, si el WAL avanzó, vuelve a comprobar que el contenido del primario siga coincidiendo.
+
+### Promoción manual y reconexión del backend
+
+Una inserción directa en el secundario devolvió SQLSTATE `25006`. Durante una prueba previa, la desconexión de un cliente ocioso de `pg` terminó Node.js con un evento `error` sin manejador. Se añadió el manejador al pool del backend. La imagen del proxy también dejó de heredar el apagado de PostgreSQL. Ahora usa el proceso init de Docker, `SIGUSR1` y un máximo de 3 s para drenar sesiones.
+
+Se inició una API temporal conectada a HAProxy por 15433 y se creó la venta `5001` con HTTP 201. Se esperó a que su LSN se aplicara en el secundario. En otra conexión del mismo pool se dejó sin confirmar el marcador `id_sucursal=-4103`, visible desde la transacción y ausente desde otra sesión. El comando `cluster.ps1 -Action Promote -Target pg2` cerró el proxy, detuvo `pg1` y promovió `pg2`.
+
+| Comprobación | Resultado |
+|---|---|
+| Primera pérdida observada desde el inicio del comando | 6,56 s |
+| Promoción y nueva conexión al escritor en el mismo puerto | 35,49 s |
+| `COMMIT` en la conexión interrumpida | `Client has encountered a connection error and is not queryable`. Cero filas con el marcador en el nuevo primario. |
+| Reintento de la venta `5001` | HTTP 200, mismo ID, `repetida: true`. El inventario pasó de 144 a 143. |
+| Misma clave con un cuerpo distinto | HTTP 409, `IDEMPOTENCY_KEY_REUTILIZADA` |
+| Outbox | Durante la interrupción registró `Connection terminated unexpectedly`. Conservó tres eventos pendientes y el siguiente ciclo publicó exactamente un documento por evento. |
+| Escritura en el nuevo primario | HTTP 201 para la venta `5034`, seguida del procesamiento de sus tres eventos. |
+
+El mismo proceso sobrevivió al error del cliente ocioso y recuperó conexiones por el pool existente. La prueba de la venta confirmada esperó la aplicación de su LSN antes de detener el primario. Ese resultado corresponde a una conmutación controlada.
+
+### Reincorporación del antiguo primario
+
+Tras la promoción, se intentó iniciar `pg1` sin prepararlo como secundario. Su contenedor rechazó el arranque y la configuración efectiva de HAProxy conservó el destino `pg1` deshabilitado.
+
+`cluster.ps1 -Action Rewind` ejecutó `pg_rewind`. La herramienta detectó la bifurcación en el LSN `0/3D68ED8` de la línea temporal 1 y determinó que no necesitaba copiar bloques del antiguo primario. Se configuró `pg1` como secundario y volvió a `streaming` siguiendo a `pg2`. Coincidieron las cinco particiones, las restricciones, los índices, los conteos y las huellas. Se verificaron 5 002 ventas, 6 eventos de Outbox y la ausencia del marcador de la transacción interrumpida.
+
+Se repitieron `Rewind`, `Initialize` y `Promote -Target pg2` sobre el grupo recuperado. Se conservaron el escritor y los conteos. `Stop` completó el apagado en 13,76 s con código 0 y `OOMKilled=false` en ambos PostgreSQL y HAProxy. PostgreSQL registró `database system is shut down` en ambos nodos. `Start` conservó los roles y verificó 70 175 registros en total, con los mismos índices, restricciones y huellas en los dos nodos. Al finalizar se detuvieron los servicios del laboratorio y se conservaron sus volúmenes.
+
+### Recuperación con WAL insuficiente
+
+Se usó el proyecto desechable `ventas-pg-repl-waltest`, con red y volúmenes propios y puertos 16431–16433. El seed cargó 70 163 registros. Tras verificar que la réplica había aplicado el WAL inicial, se detuvo `pg2` y se confirmó el marcador `id_sucursal=-4201` únicamente en `pg1`. Luego se detuvo `pg1` y se promovió manualmente `pg2`. La consulta al escritor promovido devolvió cero filas para el marcador, una pérdida deliberada de un commit que el secundario no había recibido en modalidad asíncrona.
+
+Con el antiguo primario detenido y sin autorización de escritura, un contenedor auxiliar sin red movió cuatro segmentos WAL a cuarentena dentro de su volumen desechable. `Rewind` detectó una bifurcación en `0/3D06A78` y falló al abrir el segmento `000000010000000000000003` y leer el registro `0/3D4D930`. El procedimiento conservó `ventas-pg-repl-waltest_pg1` y ejecutó `Clone` con `PG1_VOLUME=ventas-pg-repl-waltest_pg1_replacement`. La copia base desde `pg2` completó 37 561 kB y el nuevo `pg1` volvió a recibir WAL.
+
+- Un montaje de solo lectura confirmó que el volumen anterior conservaba `PG_VERSION` y los cuatro segmentos en cuarentena. Volver a ejecutar `Clone` rechazó el volumen de reemplazo ya poblado. Repetir `Initialize` y `Promote -Target pg2` conservó `pg2` como único escritor.
+- Tras `Stop` y `Start`, `pg1` seguía en recuperación y rechazó una escritura con SQLSTATE `25006`. La dirección reportada por una conexión a HAProxy coincidió con la de `pg2`. La primera lectura que encontró una fila de prueba en la réplica se observó a los 216 ms desde el inicio del sondeo posterior al commit. Luego se retiró la fila.
+- `Verify` volvió a confirmar 70 163 registros, las cinco particiones, las huellas, las restricciones, los índices y las secuencias. Las consultas explícitas de integridad devolvieron cero registros huérfanos en ventas, detalles, inventario y movimientos. Los tres contenedores quedaron detenidos con código 0.
+- Mediante el pool del backend, una división por cero devolvió SQLSTATE `22012`. La siguiente consulta en esa transacción devolvió `25P02` hasta ejecutar `ROLLBACK` explícitamente. El manejador de conexiones ociosas se limita a registrar el error. Las consultas activas conservan el error y la decisión de reintentar queda en el llamador.
+
+La replicación es asíncrona, la promoción es manual y HAProxy es un punto único de fallo. Se validó la interpolación de nombres DNS y puertos alternativos mediante `docker compose config` para ambos nodos y HAProxy. El procedimiento físico de aislamiento y promoción entre PC2 y PC3 queda por validar. Las plantillas conservaron los campos de contraseña vacíos.
